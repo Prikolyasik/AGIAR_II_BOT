@@ -208,7 +208,7 @@ bot.on('message', async (msg) => {
       model: OPENAI_MODEL,
       messages: context.messages,
       temperature: 0.7,
-      max_tokens: MAX_OUTPUT_TOKENS,
+      max_completion_tokens: MAX_OUTPUT_TOKENS,
       top_p: 1,
       stream: false
     });
@@ -240,6 +240,8 @@ bot.on('message', async (msg) => {
   } catch (error) {
     clearInterval(typingInterval);
     console.error('Ошибка при вызове API:', error);
+    console.error('Status:', error.status);
+    console.error('Response:', error.response?.data);
 
     // Обработка специфичных ошибок OpenAI
     if (error.status === 429) {
@@ -255,7 +257,7 @@ bot.on('message', async (msg) => {
     } else {
       await bot.sendMessage(chatId,
         '⚠️ Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте еще раз через несколько секунд.\n\n' +
-        'Если проблема сохраняется — свяжитесь с нами по телефону +7 (961) 883-92-17 или email: agiar@ro.ru'
+        'Если проблема сохраняется — напишите нам: @agiarservice'
       );
     }
   }
