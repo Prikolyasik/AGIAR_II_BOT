@@ -1,31 +1,39 @@
 import TelegramBot from 'node-telegram-bot-api';
-import Groq from 'groq-sdk';
+import OpenAI from 'openai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
 // Инициализация
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.1';
 
-if (!TELEGRAM_TOKEN || !GROQ_API_KEY) {
-  console.error('❌ Ошибка: Не указаны TELEGRAM_BOT_TOKEN или GROQ_API_KEY в .env файле');
+// Лимиты
+const MAX_OUTPUT_TOKENS = parseInt(process.env.MAX_OUTPUT_TOKENS) || 1200;
+const AUDIT_TOKEN_LIMIT = parseInt(process.env.AUDIT_TOKEN_LIMIT) || 100000;
+const RATE_LIMIT_REQUESTS = parseInt(process.env.RATE_LIMIT_REQUESTS) || 3;
+const RATE_LIMIT_WINDOW_SEC = parseInt(process.env.RATE_LIMIT_WINDOW_SEC) || 30;
+
+if (!TELEGRAM_TOKEN || !OPENAI_API_KEY) {
+  console.error('❌ Ошибка: Не указаны TELEGRAM_BOT_TOKEN или OPENAI_API_KEY в .env файле');
   process.exit(1);
 }
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-const groq = new Groq({ apiKey: GROQ_API_KEY });
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // Системный промпт для Ивана Интеллектовича
-const SYSTEM_PROMPT = `Role:
-Ты — IVAN INTELLEKTOVICH, высококвалифицированный эксперт по автоматизации бизнес-процессов и внедрению нейросетевых решений. Твоя цель — провести глубокий аудит бизнеса пользователя, выявить «узкие места» и предложить стратегию автоматизации, которая принесет измеримый рост прибыли и экономию ресурсов.
+const SYSTEM_PROMPT = `Ты — IVAN INTELLEKTOVICH, высококвалифицированный эксперт по автоматизации бизнес-процессов и внедрению нейросетевых решений. Твоя цель — провести глубокий аудит бизнеса пользователя, выявить «узкие места» и предложить стратегию автоматизации, которая принесет измеримый рост прибыли и экономию ресурсов.
 
 Tone of Voice:
 Профессиональный, аналитический, уверенный, но при этом лаконичный и деловой. Ты общаешься как дорогой консультант: не льстишь, а указываешь на точки роста. Используй бизнес-терминологию (ROI, LTV, конверсия, ФОТ, воронка).
 
 The Golden Rule (Strict Constraint):
-Запрещено называть конкретные названия моделей ИИ (например, GPT-4, Claude, Midjourney). Вместо этого используй термины: «интеллектуальные алгоритмы», «нейросетевые модули», «системы когнитивной обработки данных», «автоматизированные языковые узлы». Твоя задача — продать идею результата, а не инструмент. Реализацию пользователь должен получить, обратившись к команде разработчиков.
+Запрещено называть конкретные названия моделей ИИ (например, GPT-4, Claude, Midjourney). Вместо этого используй термины: «интеллектуальные алгоритмы», «нейросетевые модули», «системы когнитивной обработки данных», «автоматизированные языковые узлы».
+**Цены:** Никогда не называй стоимость услуг или внедрения. Если пользователь спрашивает о цене, отвечай вежливо, но твердо: «Стоимость внедрения рассчитывается индивидуально после детального технического задания. Для получения актуального прайса и консультации по бюджету обратитесь к нашим специалистам: @agiarservice».
+**Сроки:** Ты можешь называть только примерные ориентировочные сроки (например: «от 2 до 4 недель» или «около месяца в зависимости от сложности архитектуры»). Для получения точного графика работ отправляй пользователя в @agiarservice.
+**Переход к продаже:** Твоя цель — заинтересовать и в конце направить в @agiarservice для реализации.
 
 Workflow:
 
@@ -60,7 +68,7 @@ Impact-прогноз: Визуализируй буст (например: «Э
 
 Шаг 3: Закрытие на целевое действие
 В конце отчета сделай интригующий вывод. Скажи, что у тебя уже есть архитектурное решение для этих задач, но для детальной настройки и интеграции в их специфику нужна команда инженеров.
-Пример: «Я подготовил фундамент. Чтобы получить детальную дорожную карту внедрения и спецификации нейросетевых модулей, свяжитесь с нашими специалистами через форму на сайте или по телефону.».`;
+Пример: «Я подготовил фундамент. Чтобы получить детальную дорожную карту внедрения и спецификации нейросетевых модулей, свяжитесь с нашими специалистами: @agiarservice`;
 
 // Приветственное сообщение
 const WELCOME_MESSAGE = `Приветствую. Я — IVAN INTELLEKTOVICH.
@@ -79,20 +87,62 @@ const WELCOME_MESSAGE = `Приветствую. Я — IVAN INTELLEKTOVICH.
 
 Для начала диагностики ответьте: в какой нише ваш бизнес и сколько человек сейчас задействовано в обработке заявок или поддержке клиентов?`;
 
-// Хранилище контекста диалогов (в памяти, для продакшена лучше Redis)
+// Хранилище контекста диалогов
 const userContexts = new Map();
+
+// Хранилище для rate limiting
+const rateLimitStore = new Map();
+
+// Функция проверки rate limit
+function checkRateLimit(userId) {
+  const now = Date.now();
+  const windowMs = RATE_LIMIT_WINDOW_SEC * 1000;
+  
+  if (!rateLimitStore.has(userId)) {
+    rateLimitStore.set(userId, { count: 1, windowStart: now });
+    return { allowed: true };
+  }
+  
+  const userData = rateLimitStore.get(userId);
+  
+  // Если окно истекло, сбрасываем
+  if (now - userData.windowStart > windowMs) {
+    rateLimitStore.set(userId, { count: 1, windowStart: now });
+    return { allowed: true };
+  }
+  
+  // Если лимит исчерпан
+  if (userData.count >= RATE_LIMIT_REQUESTS) {
+    const remainingTime = Math.ceil((userData.windowStart + windowMs - now) / 1000);
+    return { allowed: false, retryAfter: remainingTime };
+  }
+  
+  // Увеличиваем счетчик
+  userData.count++;
+  rateLimitStore.set(userId, userData);
+  return { allowed: true };
+}
+
+// Функция подсчета токенов (примерная)
+function estimateTokens(text) {
+  return Math.ceil(text.length / 4);
+}
 
 // Обработка команды /start
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  
-  // Сбрасываем контекст пользователя
+  const userId = msg.from.id;
+
+  // Сбрасываем контекст и лимиты пользователя
   userContexts.set(chatId, {
     messages: [{ role: 'system', content: SYSTEM_PROMPT }],
     step: 'greeting',
-    auditData: {}
+    auditData: {},
+    tokensUsed: 0
   });
   
+  rateLimitStore.set(userId, { count: 0, windowStart: Date.now() });
+
   await bot.sendMessage(chatId, WELCOME_MESSAGE, {
     parse_mode: 'Markdown',
     disable_web_page_preview: true
@@ -103,69 +153,111 @@ bot.onText(/\/start/, async (msg) => {
 bot.on('message', async (msg) => {
   // Игнорируем команды
   if (msg.text && msg.text.startsWith('/')) return;
-  
+
   const chatId = msg.chat.id;
+  const userId = msg.from.id;
   const userMessage = msg.text;
-  
+
+  // Проверка rate limit
+  const rateLimit = checkRateLimit(userId);
+  if (!rateLimit.allowed) {
+    await bot.sendMessage(chatId, 
+      `⏱ *Слишком много запросов*\n\n` +
+      `Вы превысили лимит: ${RATE_LIMIT_REQUESTS} запрос(а) за ${RATE_LIMIT_WINDOW_SEC} сек.\n\n` +
+      `Пожалуйста, подождите ${rateLimit.retryAfter} сек. и попробуйте снова.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
   // Инициализируем контекст если нет
   if (!userContexts.has(chatId)) {
     userContexts.set(chatId, {
       messages: [{ role: 'system', content: SYSTEM_PROMPT }],
       step: 'greeting',
-      auditData: {}
+      auditData: {},
+      tokensUsed: 0
     });
   }
-  
+
   const context = userContexts.get(chatId);
   
+  // Проверка лимита токенов на аудит
+  const estimatedInputTokens = estimateTokens(userMessage);
+  if (context.tokensUsed + estimatedInputTokens + MAX_OUTPUT_TOKENS > AUDIT_TOKEN_LIMIT) {
+    await bot.sendMessage(chatId,
+      `⚠️ *Лимит токенов исчерпан*\n\n` +
+      `Вы использовали лимит в ${AUDIT_TOKEN_LIMIT} токенов на бесплатный аудит.\n\n` +
+      `Для продолжения работы и получения детальной дорожной карты обратитесь к нашим специалистам: @agiarservice`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
   // Добавляем сообщение пользователя в историю
   context.messages.push({ role: 'user', content: userMessage });
-  
+
   // Отправляем индикатор набора текста
   const typingInterval = setInterval(() => {
     bot.sendChatAction(chatId, 'typing');
   }, 1000);
-  
+
   try {
-    // Запрос к Groq API
-    const completion = await groq.chat.completions.create({
-      model: GROQ_MODEL,
+    // Запрос к OpenAI API
+    const completion = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
       messages: context.messages,
       temperature: 0.7,
-      max_tokens: 1024,
+      max_tokens: MAX_OUTPUT_TOKENS,
       top_p: 1,
-      stream: false,
-      stop: null
+      stream: false
     });
-    
+
     clearInterval(typingInterval);
-    
+
     const aiResponse = completion.choices[0]?.message?.content;
-    
+
     if (!aiResponse) {
       throw new Error('Пустой ответ от API');
     }
-    
+
+    // Подсчитываем использованные токены
+    const outputTokens = estimateTokens(aiResponse);
+    context.tokensUsed += estimatedInputTokens + outputTokens;
+
     // Добавляем ответ ИИ в историю
     context.messages.push({ role: 'assistant', content: aiResponse });
-    
+
     // Сохраняем контекст
     userContexts.set(chatId, context);
-    
+
     // Отправляем ответ пользователю
     await bot.sendMessage(chatId, aiResponse, {
       parse_mode: 'Markdown',
       disable_web_page_preview: true
     });
-    
+
   } catch (error) {
     clearInterval(typingInterval);
     console.error('Ошибка при вызове API:', error);
 
-    await bot.sendMessage(chatId,
-      '⚠️ Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте еще раз через несколько секунд.\n\n' +
-      'Если проблема сохраняется — свяжитесь с нами по телефону +7 (961) 883-92-17 или email: agiar@ro.ru'
-    );
+    // Обработка специфичных ошибок OpenAI
+    if (error.status === 429) {
+      await bot.sendMessage(chatId,
+        '⏳ *Превышен лимит API*\n\n' +
+        'Сервис временно перегружен. Пожалуйста, попробуйте через несколько секунд.'
+      );
+    } else if (error.status === 401) {
+      await bot.sendMessage(chatId,
+        '🔐 *Ошибка авторизации*\n\n' +
+        'Неверный API-ключ. Пожалуйста, сообщите администратору.'
+      );
+    } else {
+      await bot.sendMessage(chatId,
+        '⚠️ Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте еще раз через несколько секунд.\n\n' +
+        'Если проблема сохраняется — свяжитесь с нами по телефону +7 (961) 883-92-17 или email: agiar@ro.ru'
+      );
+    }
   }
 });
 
@@ -173,23 +265,26 @@ bot.on('message', async (msg) => {
 bot.on('callback_query', async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
   const data = callbackQuery.data;
-  
+
   // Логика для кнопок
   if (data === 'get_full_report') {
     await bot.sendMessage(chatId,
       '📋 *Полный отчет по автоматизации*\n\n' +
       'Для получения детальной дорожной карты внедрения и спецификаций нейросетевых модулей, свяжитесь с нашей командой:\n\n' +
       '📧 agiar@ro.ru\n' +
-      '📞 +7 (961) 883-92-17'
+      '📞 +7 (961) 883-92-17\n' +
+      '✈️ @agiarservice'
     );
   }
-  
+
   await bot.answerCallbackQuery(callbackQuery.id);
 });
 
 // Запуск бота
 console.log('🤖 IVAN INTELLEKTOVICH запущен...');
-console.log('📡 Polling активен');
+console.log(`📡 Модель: ${OPENAI_MODEL}`);
+console.log(`🔒 Лимиты: ${RATE_LIMIT_REQUESTS} запросов / ${RATE_LIMIT_WINDOW_SEC} сек`);
+console.log(`💰 Лимит токенов на аудит: ${AUDIT_TOKEN_LIMIT}`);
 console.log('━━━━━━━━━━━━━━━━━━━━━');
 
 // Обработка ошибок
